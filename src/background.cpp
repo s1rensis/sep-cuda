@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <chrono>
+
 #include "sep_cuda.h"
 #include "sep_internal.h"
 #include "sepcore.h"
@@ -28,6 +30,12 @@ static int bkg_line_flt_internal(
     const sep_bkg *bkg, float *values, float *dvalues, int64_t y, float *line);
 static int sep_bkg_line_flt(const sep_bkg *bkg, int64_t y, float *line);
 static int sep_bkg_rmsline_flt(const sep_bkg *bkg, int64_t y, float *line);
+
+static double now_ms(void) {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 static int convert_to_float_buffer(
     const void *source, int dtype, int64_t count, float **out_buf) {
@@ -68,14 +76,23 @@ extern "C" SEP_API int sep_background(
   float *imgbuf, *maskbuf;
   float maskthresh;
   sep_bkg *bkgout;
+  sep_cuda_background_profile profile;
+  double total_start_ms, phase_start_ms;
+  const int profile_enabled = sepcuda_profile_enabled();
 
   status = RETURN_OK;
   imgbuf = NULL;
   maskbuf = NULL;
   bkgout = NULL;
+  sepcuda_profile_reset_background(&profile);
+  total_start_ms = profile_enabled ? now_ms() : 0.0;
 
   if (bkg == NULL || image == NULL || image->data == NULL) {
     put_errdetail("sep_background received a null pointer");
+    if (profile_enabled) {
+      profile.total_background_ms = now_ms() - total_start_ms;
+      sepcuda_profile_commit_background(&profile);
+    }
     return ILLEGAL_APER_PARAMS;
   }
 
@@ -83,12 +100,17 @@ extern "C" SEP_API int sep_background(
 
   if (image->w <= 0 || image->h <= 0 || bw <= 0 || bh <= 0 || fw <= 0 || fh <= 0) {
     put_errdetail("sep_background received non-positive dimensions");
+    if (profile_enabled) {
+      profile.total_background_ms = now_ms() - total_start_ms;
+      sepcuda_profile_commit_background(&profile);
+    }
     return ILLEGAL_APER_PARAMS;
   }
 
   npix = image->w * image->h;
   maskthresh = image->mask ? (float)image->maskthresh : 0.0f;
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   status = convert_to_float_buffer(image->data, image->dtype, npix, &imgbuf);
   if (status != RETURN_OK) {
     goto exit;
@@ -99,6 +121,9 @@ extern "C" SEP_API int sep_background(
     if (status != RETURN_OK) {
       goto exit;
     }
+  }
+  if (profile_enabled) {
+    profile.staging_ms = now_ms() - phase_start_ms;
   }
 
   nx = (image->w - 1) / bw + 1;
@@ -125,33 +150,66 @@ extern "C" SEP_API int sep_background(
   QMALLOC(bkgout->dback, float, nb, status);
   QMALLOC(bkgout->dsigma, float, nb, status);
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   status = sep_cuda_compute_meshes(
-      imgbuf, maskbuf, image->w, image->h, bw, bh, maskthresh, bkgout->back, bkgout->sigma);
+      imgbuf,
+      maskbuf,
+      image->w,
+      image->h,
+      bw,
+      bh,
+      maskthresh,
+      bkgout->back,
+      bkgout->sigma,
+      profile_enabled ? &profile : NULL);
   if (status != RETURN_OK) {
     goto exit;
   }
+  if (profile_enabled) {
+    profile.mesh_total_ms = now_ms() - phase_start_ms;
+  }
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   status = filterback(bkgout, fw, fh, fthresh);
   if (status != RETURN_OK) {
     goto exit;
   }
+  if (profile_enabled) {
+    profile.filter_ms = now_ms() - phase_start_ms;
+  }
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   status = makebackspline(bkgout, bkgout->back, bkgout->dback);
   if (status != RETURN_OK) {
     goto exit;
   }
+  if (profile_enabled) {
+    profile.spline_back_ms = now_ms() - phase_start_ms;
+  }
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   status = makebackspline(bkgout, bkgout->sigma, bkgout->dsigma);
   if (status != RETURN_OK) {
     goto exit;
   }
+  if (profile_enabled) {
+    profile.spline_sigma_ms = now_ms() - phase_start_ms;
+    profile.total_background_ms = now_ms() - total_start_ms;
+  }
 
   free(imgbuf);
   free(maskbuf);
+  if (profile_enabled) {
+    sepcuda_profile_commit_background(&profile);
+  }
   *bkg = bkgout;
   return RETURN_OK;
 
 exit:
+  if (profile_enabled) {
+    profile.total_background_ms = now_ms() - total_start_ms;
+    sepcuda_profile_commit_background(&profile);
+  }
   free(imgbuf);
   free(maskbuf);
   sep_bkg_free(bkgout);

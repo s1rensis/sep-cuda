@@ -1,7 +1,9 @@
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <atomic>
 
 #include "sep_cuda.h"
 #include "sep_internal.h"
@@ -16,6 +18,40 @@ constexpr float kQuantifNSigma = 5.0f;
 constexpr float kQuantifAMin = 4.0f;
 constexpr float kEps = 1.0e-4f;
 constexpr float kBigFloat = 1.0e30f;
+std::atomic<bool> g_runtime_initialized{false};
+
+struct MeshWorkspace {
+  float *d_image = nullptr;
+  float *d_mask = nullptr;
+  float *d_back = nullptr;
+  float *d_sigma = nullptr;
+  float *d_coeff_back = nullptr;
+  float *d_coeff_dback = nullptr;
+  float *d_coeff_sigma = nullptr;
+  float *d_coeff_dsigma = nullptr;
+  uint16_t *d_src_u16 = nullptr;
+  uint16_t *d_dst_sub_u16 = nullptr;
+  uint16_t *d_dst_rms_u16 = nullptr;
+  size_t image_capacity_bytes = 0;
+  size_t mask_capacity_bytes = 0;
+  size_t back_capacity_bytes = 0;
+  size_t sigma_capacity_bytes = 0;
+  size_t coeff_back_capacity_bytes = 0;
+  size_t coeff_dback_capacity_bytes = 0;
+  size_t coeff_sigma_capacity_bytes = 0;
+  size_t coeff_dsigma_capacity_bytes = 0;
+  size_t src_u16_capacity_bytes = 0;
+  size_t dst_sub_u16_capacity_bytes = 0;
+  size_t dst_rms_u16_capacity_bytes = 0;
+};
+
+thread_local MeshWorkspace g_mesh_workspace{};
+
+double now_ms() {
+  return std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 inline int set_cuda_error(cudaError_t err, const char *context) {
   char detail[256];
@@ -27,6 +63,135 @@ inline int set_cuda_error(cudaError_t err, const char *context) {
       cudaGetErrorString(err));
   put_errdetail(detail);
   return (err == cudaErrorNoDevice) ? SEP_CUDA_UNAVAILABLE : SEP_CUDA_RUNTIME_ERROR;
+}
+
+template <typename T>
+inline int ensure_device_buffer(
+    T **buffer,
+    size_t *capacity_bytes,
+    size_t required_bytes,
+    const char *label,
+    sep_cuda_background_profile *profile) {
+  const int profile_enabled = profile != nullptr && profile->enabled;
+  double phase_start_ms = 0.0;
+  T *replacement = nullptr;
+  cudaError_t err;
+
+  if (required_bytes == 0 || (*buffer != nullptr && *capacity_bytes >= required_bytes)) {
+    return RETURN_OK;
+  }
+
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  err = cudaMalloc(reinterpret_cast<void **>(&replacement), required_bytes);
+  if (profile_enabled) {
+    profile->cuda_malloc_ms += now_ms() - phase_start_ms;
+  }
+  if (err != cudaSuccess) {
+    char context[128];
+    std::snprintf(context, sizeof(context), "cudaMalloc(%s)", label);
+    return set_cuda_error(err, context);
+  }
+
+  if (*buffer != nullptr) {
+    phase_start_ms = profile_enabled ? now_ms() : 0.0;
+    err = cudaFree(*buffer);
+    if (profile_enabled) {
+      profile->cuda_free_ms += now_ms() - phase_start_ms;
+    }
+    if (err != cudaSuccess) {
+      cudaFree(replacement);
+      char context[128];
+      std::snprintf(context, sizeof(context), "cudaFree(%s)", label);
+      return set_cuda_error(err, context);
+    }
+  }
+
+  *buffer = replacement;
+  *capacity_bytes = required_bytes;
+  return RETURN_OK;
+}
+
+__device__ void prepare_row_spline(
+    const float *values,
+    const float *dvalues,
+    int64_t nx,
+    int64_t ny,
+    int64_t bh,
+    int64_t y,
+    float *node,
+    float *dnode,
+    float *u) {
+  if (ny > 1) {
+    float dy = static_cast<float>(y) / static_cast<float>(bh) - 0.5f;
+    int64_t yl = static_cast<int64_t>(dy);
+    dy -= static_cast<float>(yl);
+    if (yl < 0) {
+      yl = 0;
+      dy -= 1.0f;
+    } else if (yl >= ny - 1) {
+      yl = ny < 2 ? 0 : ny - 2;
+      dy += 1.0f;
+    }
+
+    const float cdy = 1.0f - dy;
+    const float dy3 = dy * dy * dy - dy;
+    const float cdy3 = cdy * cdy * cdy - cdy;
+    const int64_t ystep = nx * yl;
+    const float *blo = values + ystep;
+    const float *bhi = blo + nx;
+    const float *dblo = dvalues + ystep;
+    const float *dbhi = dblo + nx;
+
+    for (int64_t x = 0; x < nx; ++x) {
+      node[x] = cdy * blo[x] + dy * bhi[x] + cdy3 * dblo[x] + dy3 * dbhi[x];
+    }
+
+    if (nx > 1) {
+      dnode[0] = 0.0f;
+      u[0] = 0.0f;
+      for (int64_t x = 1; x < nx - 1; ++x) {
+        float temp = -1.0f / (dnode[x - 1] + 4.0f);
+        dnode[x] = temp;
+        temp *= u[x - 1] - 6.0f * (node[x + 1] + node[x - 1] - 2.0f * node[x]);
+        u[x] = temp;
+      }
+      dnode[nx - 1] = 0.0f;
+      for (int64_t x = nx - 2; x > 0; --x) {
+        dnode[x] = (dnode[x] * dnode[x + 1] + u[x]) / 6.0f;
+      }
+    } else {
+      dnode[0] = 0.0f;
+    }
+    return;
+  }
+
+  for (int64_t x = 0; x < nx; ++x) {
+    node[x] = values[x];
+    dnode[x] = dvalues[x];
+  }
+}
+
+__device__ float evaluate_row_spline(
+    const float *node, const float *dnode, int64_t nx, int64_t bw, int64_t x) {
+  if (nx <= 1) {
+    return node[0];
+  }
+
+  float dx = (static_cast<float>(x) + 0.5f) / static_cast<float>(bw) - 0.5f;
+  int64_t xl = static_cast<int64_t>(dx);
+  dx -= static_cast<float>(xl);
+
+  if (xl < 0) {
+    xl = 0;
+    dx -= 1.0f;
+  } else if (xl >= nx - 1) {
+    xl = nx < 2 ? 0 : nx - 2;
+    dx += 1.0f;
+  }
+
+  const float cdx = 1.0f - dx;
+  return cdx * (node[xl] + (cdx * cdx - 1.0f) * dnode[xl]) +
+         dx * (node[xl + 1] + (dx * dx - 1.0f) * dnode[xl + 1]);
 }
 
 __device__ float backguess_device(
@@ -273,7 +438,60 @@ __global__ void compute_mesh_kernel(
   }
 }
 
+__global__ void subtract_background_u16_kernel(
+    const uint16_t *src,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    int64_t nx,
+    int64_t ny,
+    const float *back,
+    const float *dback,
+    const float *sigma,
+    const float *dsigma,
+    uint16_t *dst_subtracted,
+    uint16_t *dst_rms) {
+  extern __shared__ float shared[];
+  float *back_node = shared;
+  float *back_dnode = back_node + nx;
+  float *back_u = back_dnode + nx;
+  float *sigma_node = back_u + nx;
+  float *sigma_dnode = sigma_node + nx;
+  float *sigma_u = sigma_dnode + nx;
+
+  const int64_t y = static_cast<int64_t>(blockIdx.x);
+  const int64_t tid = static_cast<int64_t>(threadIdx.x);
+
+  if (y >= height) {
+    return;
+  }
+
+  if (tid == 0) {
+    prepare_row_spline(back, dback, nx, ny, bh, y, back_node, back_dnode, back_u);
+    prepare_row_spline(sigma, dsigma, nx, ny, bh, y, sigma_node, sigma_dnode, sigma_u);
+  }
+  __syncthreads();
+
+  const int64_t row_offset = y * width;
+  for (int64_t x = tid; x < width; x += blockDim.x) {
+    const float background = evaluate_row_spline(back_node, back_dnode, nx, bw, x);
+    const float rms = evaluate_row_spline(sigma_node, sigma_dnode, nx, bw, x);
+    const int background_i = static_cast<int>(background + 0.5f);
+    const int rms_i = static_cast<int>(rms + 0.5f);
+    const int corrected = static_cast<int>(src[row_offset + x]) - background_i;
+
+    dst_subtracted[row_offset + x] = static_cast<uint16_t>(corrected > 0 ? corrected : 0);
+    dst_rms[row_offset + x] = static_cast<uint16_t>(rms_i > 0 ? rms_i : 0);
+  }
+}
+
 }  // namespace
+
+extern "C" void sepcuda_profile_reset_runtime_state(void) {
+  g_runtime_initialized.store(false, std::memory_order_release);
+  g_mesh_workspace = MeshWorkspace{};
+}
 
 extern "C" int sep_cuda_compute_meshes(
     const float *image,
@@ -284,20 +502,33 @@ extern "C" int sep_cuda_compute_meshes(
     int64_t bh,
     float maskthresh,
     float *back,
-    float *sigma) {
+    float *sigma,
+    sep_cuda_background_profile *profile) {
+  int status;
   cudaError_t err;
   int device_count;
   int64_t nx, ny, mesh_count;
   size_t image_bytes;
   size_t mesh_bytes;
-  float *d_image, *d_mask, *d_back, *d_sigma;
+  double phase_start_ms;
+  const int profile_enabled = profile != NULL && profile->enabled;
+  MeshWorkspace &workspace = g_mesh_workspace;
 
-  d_image = nullptr;
-  d_mask = nullptr;
-  d_back = nullptr;
-  d_sigma = nullptr;
+  if (profile_enabled && !g_runtime_initialized.exchange(true, std::memory_order_acq_rel)) {
+    phase_start_ms = now_ms();
+    err = cudaFree(nullptr);
+    profile->runtime_init_ms = now_ms() - phase_start_ms;
+    profile->runtime_init_performed = 1;
+    if (err != cudaSuccess) {
+      return set_cuda_error(err, "cudaFree(nullptr)");
+    }
+  }
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   err = cudaGetDeviceCount(&device_count);
+  if (profile_enabled) {
+    profile->cuda_get_device_count_ms = now_ms() - phase_start_ms;
+  }
   if (err != cudaSuccess) {
     return set_cuda_error(err, "cudaGetDeviceCount");
   }
@@ -312,73 +543,227 @@ extern "C" int sep_cuda_compute_meshes(
   image_bytes = static_cast<size_t>(width * height) * sizeof(float);
   mesh_bytes = static_cast<size_t>(mesh_count) * sizeof(float);
 
-  err = cudaMalloc(reinterpret_cast<void **>(&d_image), image_bytes);
-  if (err != cudaSuccess) {
-    return set_cuda_error(err, "cudaMalloc(image)");
+  status = ensure_device_buffer(
+      &workspace.d_image, &workspace.image_capacity_bytes, image_bytes, "image", profile);
+  if (status != RETURN_OK) {
+    return status;
   }
 
-  err = cudaMemcpy(d_image, image, image_bytes, cudaMemcpyHostToDevice);
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  err = cudaMemcpy(workspace.d_image, image, image_bytes, cudaMemcpyHostToDevice);
   if (err != cudaSuccess) {
-    cudaFree(d_image);
+    if (profile_enabled) {
+      profile->h2d_ms += now_ms() - phase_start_ms;
+    }
     return set_cuda_error(err, "cudaMemcpy(image)");
+  }
+  if (profile_enabled) {
+    profile->h2d_ms += now_ms() - phase_start_ms;
   }
 
   if (mask != nullptr) {
-    err = cudaMalloc(reinterpret_cast<void **>(&d_mask), image_bytes);
-    if (err != cudaSuccess) {
-      cudaFree(d_image);
-      return set_cuda_error(err, "cudaMalloc(mask)");
+    status = ensure_device_buffer(
+        &workspace.d_mask, &workspace.mask_capacity_bytes, image_bytes, "mask", profile);
+    if (status != RETURN_OK) {
+      return status;
     }
-    err = cudaMemcpy(d_mask, mask, image_bytes, cudaMemcpyHostToDevice);
+    phase_start_ms = profile_enabled ? now_ms() : 0.0;
+    err = cudaMemcpy(workspace.d_mask, mask, image_bytes, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
-      cudaFree(d_mask);
-      cudaFree(d_image);
+      if (profile_enabled) {
+        profile->h2d_ms += now_ms() - phase_start_ms;
+      }
       return set_cuda_error(err, "cudaMemcpy(mask)");
     }
+    if (profile_enabled) {
+      profile->h2d_ms += now_ms() - phase_start_ms;
+    }
   }
 
-  err = cudaMalloc(reinterpret_cast<void **>(&d_back), mesh_bytes);
-  if (err != cudaSuccess) {
-    cudaFree(d_mask);
-    cudaFree(d_image);
-    return set_cuda_error(err, "cudaMalloc(back)");
+  status = ensure_device_buffer(
+      &workspace.d_back, &workspace.back_capacity_bytes, mesh_bytes, "back", profile);
+  if (status != RETURN_OK) {
+    return status;
   }
 
-  err = cudaMalloc(reinterpret_cast<void **>(&d_sigma), mesh_bytes);
-  if (err != cudaSuccess) {
-    cudaFree(d_back);
-    cudaFree(d_mask);
-    cudaFree(d_image);
-    return set_cuda_error(err, "cudaMalloc(sigma)");
+  status = ensure_device_buffer(
+      &workspace.d_sigma, &workspace.sigma_capacity_bytes, mesh_bytes, "sigma", profile);
+  if (status != RETURN_OK) {
+    return status;
   }
 
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
   compute_mesh_kernel<<<dim3(static_cast<unsigned int>(nx), static_cast<unsigned int>(ny)), kThreadsPerBlock>>>(
-      d_image, d_mask, width, height, bw, bh, nx, ny, maskthresh, d_back, d_sigma);
+      workspace.d_image,
+      mask ? workspace.d_mask : nullptr,
+      width,
+      height,
+      bw,
+      bh,
+      nx,
+      ny,
+      maskthresh,
+      workspace.d_back,
+      workspace.d_sigma);
+
+  err = cudaGetLastError();
+  if (err == cudaSuccess) {
+    err = cudaDeviceSynchronize();
+  }
+  if (profile_enabled) {
+    profile->kernel_ms += now_ms() - phase_start_ms;
+  }
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "compute_mesh_kernel");
+  }
+
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  err = cudaMemcpy(back, workspace.d_back, mesh_bytes, cudaMemcpyDeviceToHost);
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(sigma, workspace.d_sigma, mesh_bytes, cudaMemcpyDeviceToHost);
+  }
+  if (profile_enabled) {
+    profile->d2h_ms += now_ms() - phase_start_ms;
+  }
+
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(results)");
+  }
+
+  return RETURN_OK;
+}
+
+extern "C" int sep_cuda_subtract_background_and_fill_rms_u16_fast(
+    const sep_bkg *bkg,
+    const uint16_t *src,
+    uint16_t *dst_subtracted,
+    uint16_t *dst_rms) {
+  cudaError_t err;
+  MeshWorkspace &workspace = g_mesh_workspace;
+  const int64_t width = bkg->w;
+  const int64_t height = bkg->h;
+  const int64_t mesh_count = bkg->n;
+  const size_t image_bytes = static_cast<size_t>(width * height) * sizeof(uint16_t);
+  const size_t coeff_bytes = static_cast<size_t>(mesh_count) * sizeof(float);
+  const size_t shared_bytes = static_cast<size_t>(6 * bkg->nx) * sizeof(float);
+  int status;
+
+  if (bkg == nullptr || src == nullptr || dst_subtracted == nullptr || dst_rms == nullptr) {
+    put_errdetail("u16 fast path received a null pointer");
+    return ILLEGAL_APER_PARAMS;
+  }
+
+  status = ensure_device_buffer(
+      &workspace.d_src_u16,
+      &workspace.src_u16_capacity_bytes,
+      image_bytes,
+      "src_u16",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_dst_sub_u16,
+      &workspace.dst_sub_u16_capacity_bytes,
+      image_bytes,
+      "dst_sub_u16",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_dst_rms_u16,
+      &workspace.dst_rms_u16_capacity_bytes,
+      image_bytes,
+      "dst_rms_u16",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_coeff_back,
+      &workspace.coeff_back_capacity_bytes,
+      coeff_bytes,
+      "coeff_back",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_coeff_dback,
+      &workspace.coeff_dback_capacity_bytes,
+      coeff_bytes,
+      "coeff_dback",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_coeff_sigma,
+      &workspace.coeff_sigma_capacity_bytes,
+      coeff_bytes,
+      "coeff_sigma",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_coeff_dsigma,
+      &workspace.coeff_dsigma_capacity_bytes,
+      coeff_bytes,
+      "coeff_dsigma",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+
+  err = cudaMemcpy(workspace.d_src_u16, src, image_bytes, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(src_u16)");
+  }
+  err = cudaMemcpy(workspace.d_coeff_back, bkg->back, coeff_bytes, cudaMemcpyHostToDevice);
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(workspace.d_coeff_dback, bkg->dback, coeff_bytes, cudaMemcpyHostToDevice);
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(workspace.d_coeff_sigma, bkg->sigma, coeff_bytes, cudaMemcpyHostToDevice);
+  }
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(workspace.d_coeff_dsigma, bkg->dsigma, coeff_bytes, cudaMemcpyHostToDevice);
+  }
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(bkg_coefficients)");
+  }
+
+  subtract_background_u16_kernel<<<static_cast<unsigned int>(height), kThreadsPerBlock, shared_bytes>>>(
+      workspace.d_src_u16,
+      width,
+      height,
+      bkg->bw,
+      bkg->bh,
+      bkg->nx,
+      bkg->ny,
+      workspace.d_coeff_back,
+      workspace.d_coeff_dback,
+      workspace.d_coeff_sigma,
+      workspace.d_coeff_dsigma,
+      workspace.d_dst_sub_u16,
+      workspace.d_dst_rms_u16);
 
   err = cudaGetLastError();
   if (err == cudaSuccess) {
     err = cudaDeviceSynchronize();
   }
   if (err != cudaSuccess) {
-    cudaFree(d_sigma);
-    cudaFree(d_back);
-    cudaFree(d_mask);
-    cudaFree(d_image);
-    return set_cuda_error(err, "compute_mesh_kernel");
+    return set_cuda_error(err, "subtract_background_u16_kernel");
   }
 
-  err = cudaMemcpy(back, d_back, mesh_bytes, cudaMemcpyDeviceToHost);
+  err = cudaMemcpy(dst_subtracted, workspace.d_dst_sub_u16, image_bytes, cudaMemcpyDeviceToHost);
   if (err == cudaSuccess) {
-    err = cudaMemcpy(sigma, d_sigma, mesh_bytes, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(dst_rms, workspace.d_dst_rms_u16, image_bytes, cudaMemcpyDeviceToHost);
   }
-
-  cudaFree(d_sigma);
-  cudaFree(d_back);
-  cudaFree(d_mask);
-  cudaFree(d_image);
-
   if (err != cudaSuccess) {
-    return set_cuda_error(err, "cudaMemcpy(results)");
+    return set_cuda_error(err, "cudaMemcpy(u16_outputs)");
   }
 
   return RETURN_OK;

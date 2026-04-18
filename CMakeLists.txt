@@ -25,6 +25,8 @@ find_package(CUDAToolkit REQUIRED)
 add_library(sep_cuda SHARED
   src/background.cpp
   src/cuda_background.cu
+  src/profiling.cpp
+  src/u16_pipeline.cpp
   src/util.cpp
 )
 
@@ -51,7 +53,11 @@ install(TARGETS sep_cuda
   RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
-install(FILES src/sep_cuda.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES
+  src/sep_cuda.h
+  src/sep_cuda_addon.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
 install(FILES python/sep_cuda.py DESTINATION python)
 
 configure_package_config_file(
@@ -91,6 +97,11 @@ if(SEPCUDA_BUILD_TESTS)
   add_test(NAME sepcuda_smoke COMMAND test_smoke)
   set_tests_properties(sepcuda_smoke PROPERTIES SKIP_RETURN_CODE 77)
 
+  add_executable(test_u16_pipeline tests/test_u16_pipeline.cpp)
+  target_link_libraries(test_u16_pipeline PRIVATE sep_cuda m)
+  add_test(NAME sepcuda_u16_pipeline COMMAND test_u16_pipeline)
+  set_tests_properties(sepcuda_u16_pipeline PROPERTIES SKIP_RETURN_CODE 77)
+
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
     add_test(
@@ -128,5 +139,10 @@ if(SEPCUDA_BUILD_TESTS)
       COMMAND test_compare $<TARGET_FILE:sep_cuda> ${SEPCUDA_REFERENCE_SEP_LIBRARY}
     )
     set_tests_properties(sepcuda_compare_reference PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(profile_background tests/profile_background.cpp)
+    target_link_libraries(profile_background PRIVATE dl m CUDA::cudart)
+    target_include_directories(profile_background PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_dependencies(profile_background sep_reference_build)
   endif()
 endif()

@@ -1,6 +1,6 @@
 # sep-cuda
 
-Originally at [sep-developers/sep](https://github.com/sep-developers), currently only contains background modeling, highly vibe coded, **use with caution**.
+Originally at [sep-developers/sep](https://github.com/sep-developers), currently only contains background modeling, highly vibe-coded, **use with caution**.
 
 Build the library:
 
@@ -19,6 +19,7 @@ Main outputs:
 
 ```text
 build/dist/include/sep_cuda.h
+build/dist/include/sep_cuda_addon.h
 build/dist/lib/lib_sep_cuda.so
 build/dist/lib/cmake/SEPCUDA/
 build/dist/python/sep_cuda.py
