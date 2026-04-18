@@ -8,9 +8,10 @@ include(ExternalProject)
 
 option(SEPCUDA_BUILD_TESTS "Build tests" ON)
 set(SEPCUDA_REFERENCE_SEP_SOURCE_DIR "" CACHE PATH "Optional path to CPU SEP source tree for comparison tests")
+set(SEPCUDA_DIST_DIR "${CMAKE_BINARY_DIR}/dist" CACHE PATH "Output directory for the dist target")
 
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
-  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/dist" CACHE PATH "Install prefix" FORCE)
+  set(CMAKE_INSTALL_PREFIX "${SEPCUDA_DIST_DIR}" CACHE PATH "Install prefix" FORCE)
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -51,6 +52,7 @@ install(TARGETS sep_cuda
 )
 
 install(FILES src/sep_cuda.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES python/sep_cuda.py DESTINATION python)
 
 configure_package_config_file(
   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/SEPCUDAConfig.cmake.in
@@ -77,7 +79,7 @@ install(EXPORT SEPCUDATargets
 )
 
 add_custom_target(dist
-  COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --prefix ${CMAKE_INSTALL_PREFIX}
+  COMMAND ${CMAKE_COMMAND} --install ${CMAKE_BINARY_DIR} --prefix ${SEPCUDA_DIST_DIR}
   DEPENDS sep_cuda
 )
 
@@ -88,6 +90,20 @@ if(SEPCUDA_BUILD_TESTS)
   target_link_libraries(test_smoke PRIVATE sep_cuda m)
   add_test(NAME sepcuda_smoke COMMAND test_smoke)
   set_tests_properties(sepcuda_smoke PROPERTIES SKIP_RETURN_CODE 77)
+
+  find_package(Python3 COMPONENTS Interpreter QUIET)
+  if(Python3_Interpreter_FOUND)
+    add_test(
+      NAME sepcuda_python_background
+      COMMAND
+        ${CMAKE_COMMAND} -E env
+          PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python
+          LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}:$ENV{LD_LIBRARY_PATH}
+          ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_python_background.py
+    )
+    set_tests_properties(sepcuda_python_background PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 
   if(SEPCUDA_REFERENCE_SEP_SOURCE_DIR)
     set(SEPCUDA_REFERENCE_SEP_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/sep_reference)

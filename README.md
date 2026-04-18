@@ -21,6 +21,7 @@ Main outputs:
 build/dist/include/sep_cuda.h
 build/dist/lib/lib_sep_cuda.so
 build/dist/lib/cmake/SEPCUDA/
+build/dist/python/sep_cuda.py
 ```
 
 Build the minimal example against the generated package:
@@ -28,4 +29,11 @@ Build the minimal example against the generated package:
 ```bash
 cmake -S examples/minimal -B /tmp/sep-cuda-example -DCMAKE_PREFIX_PATH=$PWD/build/dist
 cmake --build /tmp/sep-cuda-example -j
+```
+
+Use the Python background wrapper from the generated package:
+
+```bash
+export PYTHONPATH=$PWD/build/dist/python
+python3 -c "import sep_cuda; print(sep_cuda.Background)"
 ```

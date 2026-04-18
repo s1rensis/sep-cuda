@@ -1,0 +1,17 @@
+[project]
+name = "sep-cuda-dev"
+version = "0.1.0"
+description = "Minimal Python environment for sep-cuda demos"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "sep",
+  "astropy",
+  "matplotlib",
+  "opencv-python",
+  "opencv-python-headless",
+  "pillow",
+]
+
+[tool.uv]
+package = false
