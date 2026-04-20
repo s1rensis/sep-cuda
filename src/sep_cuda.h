@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 #define SEP_TBYTE 11
+#define SEP_TUSHORT 21
 #define SEP_TINT 31
 #define SEP_TFLOAT 42
 #define SEP_TDOUBLE 82
@@ -177,8 +178,14 @@ inline constexpr bool is_byte_v =
     std::is_same_v<remove_cvref_t<T>, unsigned char>;
 
 template <typename T>
+inline constexpr bool is_ushort_v =
+    std::is_same_v<remove_cvref_t<T>, uint16_t> ||
+    std::is_same_v<remove_cvref_t<T>, unsigned short>;
+
+template <typename T>
 inline constexpr bool is_native_sep_dtype_v =
     is_byte_v<T> ||
+    is_ushort_v<T> ||
     std::is_same_v<remove_cvref_t<T>, int> ||
     std::is_same_v<remove_cvref_t<T>, float> ||
     std::is_same_v<remove_cvref_t<T>, double>;
@@ -188,6 +195,8 @@ inline int native_sep_dtype() {
   using Bare = remove_cvref_t<T>;
   if constexpr (is_byte_v<Bare>) {
     return SEP_TBYTE;
+  } else if constexpr (is_ushort_v<Bare>) {
+    return SEP_TUSHORT;
   } else if constexpr (std::is_same_v<Bare, int>) {
     return SEP_TINT;
   } else if constexpr (std::is_same_v<Bare, float>) {

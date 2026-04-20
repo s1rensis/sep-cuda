@@ -31,15 +31,12 @@ int build_background(
   }
 
   image.data = src;
-  image.dtype = SEP_TINT;
+  image.dtype = SEP_TUSHORT;
   image.w = width;
   image.h = height;
   image.noise_type = SEP_NOISE_NONE;
   image.maskthresh = 0.0;
   image.gain = 1.0;
-
-  sepcuda::HostImage host(src, width, height);
-  image.data = host.view().data;
 
   return sep_background(&image, bw, bh, fw, fh, fthresh, bkg_out);
 }

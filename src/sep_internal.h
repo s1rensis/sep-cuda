@@ -39,6 +39,16 @@ int sep_cuda_compute_meshes(
     float *sigma,
     sep_cuda_background_profile *profile);
 
+int sep_cuda_compute_meshes_u16(
+    const uint16_t *image,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    float *back,
+    float *sigma,
+    sep_cuda_background_profile *profile);
+
 int sepcuda_profile_enabled(void);
 void sepcuda_profile_reset_background(sep_cuda_background_profile *profile);
 void sepcuda_profile_commit_background(const sep_cuda_background_profile *profile);

@@ -438,6 +438,175 @@ __global__ void compute_mesh_kernel(
   }
 }
 
+__global__ void compute_mesh_u16_kernel(
+    const uint16_t *image,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    int64_t nx,
+    int64_t ny,
+    float *back,
+    float *sigma) {
+  __shared__ double s_sum[kThreadsPerBlock];
+  __shared__ double s_sumsq[kThreadsPerBlock];
+  __shared__ int s_count[kThreadsPerBlock];
+  __shared__ int s_hist[kMaxLevels];
+  __shared__ float s_lcut;
+  __shared__ float s_hcut;
+  __shared__ float s_qscale;
+  __shared__ float s_qzero;
+  __shared__ float s_sigma_input;
+  __shared__ int s_valid_count;
+  __shared__ int s_nlevels;
+  __shared__ int s_bad_tile;
+
+  const int tile_x = blockIdx.x;
+  const int tile_y = blockIdx.y;
+  const int tile_index = tile_y * static_cast<int>(nx) + tile_x;
+  const int local_tid = threadIdx.x;
+
+  if (tile_x >= nx || tile_y >= ny) {
+    return;
+  }
+
+  const int64_t x0 = static_cast<int64_t>(tile_x) * bw;
+  const int64_t y0 = static_cast<int64_t>(tile_y) * bh;
+  const int tile_w = static_cast<int>((bw < (width - x0)) ? bw : (width - x0));
+  const int tile_h = static_cast<int>((bh < (height - y0)) ? bh : (height - y0));
+  const int tile_pixels = tile_w * tile_h;
+  const float step = sqrtf(2.0f / static_cast<float>(M_PI)) * kQuantifNSigma / kQuantifAMin;
+
+  double sum = 0.0;
+  double sumsq = 0.0;
+  int count = 0;
+
+  for (int i = local_tid; i < tile_pixels; i += blockDim.x) {
+    const int local_x = i % tile_w;
+    const int local_y = i / tile_w;
+    const int64_t index = (y0 + local_y) * width + (x0 + local_x);
+    const float pixel = static_cast<float>(image[index]);
+    sum += pixel;
+    sumsq += pixel * pixel;
+    count++;
+  }
+
+  s_sum[local_tid] = sum;
+  s_sumsq[local_tid] = sumsq;
+  s_count[local_tid] = count;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (local_tid < stride) {
+      s_sum[local_tid] += s_sum[local_tid + stride];
+      s_sumsq[local_tid] += s_sumsq[local_tid + stride];
+      s_count[local_tid] += s_count[local_tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (local_tid == 0) {
+    s_valid_count = s_count[0];
+    s_bad_tile = (static_cast<float>(s_valid_count) < static_cast<float>(tile_pixels) * kBackMinGoodFrac);
+
+    if (s_bad_tile) {
+      back[tile_index] = -kBigFloat;
+      sigma[tile_index] = -kBigFloat;
+      s_lcut = 0.0f;
+      s_hcut = 0.0f;
+      s_qscale = 1.0f;
+      s_qzero = 0.0f;
+      s_sigma_input = 0.0f;
+      s_nlevels = 1;
+    } else {
+      const double mean = s_sum[0] / static_cast<double>(s_valid_count);
+      const double sig = s_sumsq[0] / static_cast<double>(s_valid_count) - mean * mean;
+      const double sigma1 = sig > 0.0 ? sqrt(sig) : 0.0;
+
+      s_lcut = static_cast<float>(mean - 2.0 * sigma1);
+      s_hcut = static_cast<float>(mean + 2.0 * sigma1);
+    }
+  }
+  __syncthreads();
+
+  if (s_bad_tile) {
+    return;
+  }
+
+  sum = 0.0;
+  sumsq = 0.0;
+  count = 0;
+  for (int i = local_tid; i < tile_pixels; i += blockDim.x) {
+    const int local_x = i % tile_w;
+    const int local_y = i / tile_w;
+    const int64_t index = (y0 + local_y) * width + (x0 + local_x);
+    const float pixel = static_cast<float>(image[index]);
+    if (pixel >= s_lcut && pixel <= s_hcut) {
+      sum += pixel;
+      sumsq += pixel * pixel;
+      count++;
+    }
+  }
+
+  s_sum[local_tid] = sum;
+  s_sumsq[local_tid] = sumsq;
+  s_count[local_tid] = count;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (local_tid < stride) {
+      s_sum[local_tid] += s_sum[local_tid + stride];
+      s_sumsq[local_tid] += s_sumsq[local_tid + stride];
+      s_count[local_tid] += s_count[local_tid + stride];
+    }
+    __syncthreads();
+  }
+
+  if (local_tid == 0) {
+    const double mean = s_sum[0] / static_cast<double>(s_count[0]);
+    const double sig = s_sumsq[0] / static_cast<double>(s_count[0]) - mean * mean;
+    const float sigma2 = static_cast<float>(sig > 0.0 ? sqrt(sig) : 0.0);
+
+    s_valid_count = s_count[0];
+    s_sigma_input = sigma2;
+    s_nlevels = static_cast<int>(step * s_valid_count + 1.0f);
+    if (s_nlevels > kMaxLevels) {
+      s_nlevels = kMaxLevels;
+    }
+    if (s_nlevels < 1) {
+      s_nlevels = 1;
+    }
+    s_qscale = sigma2 > 0.0f ? 2.0f * kQuantifNSigma * sigma2 / static_cast<float>(s_nlevels) : 1.0f;
+    s_qzero = static_cast<float>(mean) - kQuantifNSigma * sigma2;
+  }
+  __syncthreads();
+
+  for (int i = local_tid; i < kMaxLevels; i += blockDim.x) {
+    s_hist[i] = 0;
+  }
+  __syncthreads();
+
+  const float cste = 0.499999f - s_qzero / s_qscale;
+  for (int i = local_tid; i < tile_pixels; i += blockDim.x) {
+    const int local_x = i % tile_w;
+    const int local_y = i / tile_w;
+    const int64_t index = (y0 + local_y) * width + (x0 + local_x);
+    const float pixel = static_cast<float>(image[index]);
+    const int bin = static_cast<int>(pixel / s_qscale + cste);
+    if (bin >= 0 && bin < s_nlevels) {
+      atomicAdd(&s_hist[bin], 1);
+    }
+  }
+  __syncthreads();
+
+  if (local_tid == 0) {
+    float out_sigma = 0.0f;
+    back[tile_index] = backguess_device(
+        s_hist, s_nlevels, s_sigma_input, s_qscale, s_qzero, &out_sigma);
+    sigma[tile_index] = out_sigma;
+  }
+}
+
 __global__ void subtract_background_u16_kernel(
     const uint16_t *src,
     int64_t width,
@@ -666,6 +835,123 @@ extern "C" int sep_cuda_compute_meshes(
 
   if (err != cudaSuccess) {
     return set_cuda_error(err, "cudaMemcpy(results)");
+  }
+
+  return RETURN_OK;
+}
+
+extern "C" int sep_cuda_compute_meshes_u16(
+    const uint16_t *image,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    float *back,
+    float *sigma,
+    sep_cuda_background_profile *profile) {
+  int status;
+  cudaError_t err;
+  int device_count;
+  int64_t nx, ny, mesh_count;
+  size_t image_bytes;
+  size_t mesh_bytes;
+  double phase_start_ms;
+  const int profile_enabled = profile != NULL && profile->enabled;
+  MeshWorkspace &workspace = g_mesh_workspace;
+
+  if (profile_enabled && !g_runtime_initialized.exchange(true, std::memory_order_acq_rel)) {
+    phase_start_ms = now_ms();
+    err = cudaFree(nullptr);
+    profile->runtime_init_ms = now_ms() - phase_start_ms;
+    profile->runtime_init_performed = 1;
+    if (err != cudaSuccess) {
+      return set_cuda_error(err, "cudaFree(nullptr)");
+    }
+  }
+
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  err = cudaGetDeviceCount(&device_count);
+  if (profile_enabled) {
+    profile->cuda_get_device_count_ms = now_ms() - phase_start_ms;
+  }
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaGetDeviceCount");
+  }
+  if (device_count <= 0) {
+    put_errdetail("no CUDA device available");
+    return SEP_CUDA_UNAVAILABLE;
+  }
+
+  nx = (width - 1) / bw + 1;
+  ny = (height - 1) / bh + 1;
+  mesh_count = nx * ny;
+  image_bytes = static_cast<size_t>(width * height) * sizeof(uint16_t);
+  mesh_bytes = static_cast<size_t>(mesh_count) * sizeof(float);
+
+  status = ensure_device_buffer(
+      &workspace.d_src_u16, &workspace.src_u16_capacity_bytes, image_bytes, "mesh_u16", profile);
+  if (status != RETURN_OK) {
+    return status;
+  }
+
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  err = cudaMemcpy(workspace.d_src_u16, image, image_bytes, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    if (profile_enabled) {
+      profile->h2d_ms += now_ms() - phase_start_ms;
+    }
+    return set_cuda_error(err, "cudaMemcpy(image_u16)");
+  }
+  if (profile_enabled) {
+    profile->h2d_ms += now_ms() - phase_start_ms;
+  }
+
+  status = ensure_device_buffer(
+      &workspace.d_back, &workspace.back_capacity_bytes, mesh_bytes, "back", profile);
+  if (status != RETURN_OK) {
+    return status;
+  }
+
+  status = ensure_device_buffer(
+      &workspace.d_sigma, &workspace.sigma_capacity_bytes, mesh_bytes, "sigma", profile);
+  if (status != RETURN_OK) {
+    return status;
+  }
+
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  compute_mesh_u16_kernel<<<dim3(static_cast<unsigned int>(nx), static_cast<unsigned int>(ny)), kThreadsPerBlock>>>(
+      workspace.d_src_u16,
+      width,
+      height,
+      bw,
+      bh,
+      nx,
+      ny,
+      workspace.d_back,
+      workspace.d_sigma);
+
+  err = cudaGetLastError();
+  if (err == cudaSuccess) {
+    err = cudaDeviceSynchronize();
+  }
+  if (profile_enabled) {
+    profile->kernel_ms += now_ms() - phase_start_ms;
+  }
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "compute_mesh_u16_kernel");
+  }
+
+  phase_start_ms = profile_enabled ? now_ms() : 0.0;
+  err = cudaMemcpy(back, workspace.d_back, mesh_bytes, cudaMemcpyDeviceToHost);
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(sigma, workspace.d_sigma, mesh_bytes, cudaMemcpyDeviceToHost);
+  }
+  if (profile_enabled) {
+    profile->d2h_ms += now_ms() - phase_start_ms;
+  }
+
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(results_u16)");
   }
 
   return RETURN_OK;

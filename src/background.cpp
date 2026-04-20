@@ -111,9 +111,11 @@ extern "C" SEP_API int sep_background(
   maskthresh = image->mask ? (float)image->maskthresh : 0.0f;
 
   phase_start_ms = profile_enabled ? now_ms() : 0.0;
-  status = convert_to_float_buffer(image->data, image->dtype, npix, &imgbuf);
-  if (status != RETURN_OK) {
-    goto exit;
+  if (image->dtype != SEP_TUSHORT || image->mask != NULL) {
+    status = convert_to_float_buffer(image->data, image->dtype, npix, &imgbuf);
+    if (status != RETURN_OK) {
+      goto exit;
+    }
   }
 
   if (image->mask != NULL) {
@@ -151,17 +153,29 @@ extern "C" SEP_API int sep_background(
   QMALLOC(bkgout->dsigma, float, nb, status);
 
   phase_start_ms = profile_enabled ? now_ms() : 0.0;
-  status = sep_cuda_compute_meshes(
-      imgbuf,
-      maskbuf,
-      image->w,
-      image->h,
-      bw,
-      bh,
-      maskthresh,
-      bkgout->back,
-      bkgout->sigma,
-      profile_enabled ? &profile : NULL);
+  if (image->dtype == SEP_TUSHORT && image->mask == NULL) {
+    status = sep_cuda_compute_meshes_u16(
+        (const uint16_t *)image->data,
+        image->w,
+        image->h,
+        bw,
+        bh,
+        bkgout->back,
+        bkgout->sigma,
+        profile_enabled ? &profile : NULL);
+  } else {
+    status = sep_cuda_compute_meshes(
+        imgbuf,
+        maskbuf,
+        image->w,
+        image->h,
+        bw,
+        bh,
+        maskthresh,
+        bkgout->back,
+        bkgout->sigma,
+        profile_enabled ? &profile : NULL);
+  }
   if (status != RETURN_OK) {
     goto exit;
   }

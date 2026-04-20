@@ -26,6 +26,10 @@ PIXTYPE convert_byt(const void *ptr) {
   return *(const BYTE *)ptr;
 }
 
+PIXTYPE convert_ushort(const void *ptr) {
+  return *(const uint16_t *)ptr;
+}
+
 int get_converter(int dtype, converter *f, int64_t *size) {
   int status = RETURN_OK;
 
@@ -41,6 +45,9 @@ int get_converter(int dtype, converter *f, int64_t *size) {
   } else if (dtype == SEP_TBYTE) {
     *f = convert_byt;
     *size = sizeof(BYTE);
+  } else if (dtype == SEP_TUSHORT) {
+    *f = convert_ushort;
+    *size = sizeof(uint16_t);
   } else {
     *f = NULL;
     *size = 0;
@@ -82,6 +89,14 @@ void convert_array_byt(const void *ptr, int64_t n, PIXTYPE *target) {
   }
 }
 
+void convert_array_ushort(const void *ptr, int64_t n, PIXTYPE *target) {
+  const uint16_t *source = (const uint16_t *)ptr;
+  int64_t i;
+  for (i = 0; i < n; i++) {
+    target[i] = (float)source[i];
+  }
+}
+
 int get_array_converter(int dtype, array_converter *f, int64_t *size) {
   int status = RETURN_OK;
 
@@ -97,6 +112,9 @@ int get_array_converter(int dtype, array_converter *f, int64_t *size) {
   } else if (dtype == SEP_TBYTE) {
     *f = convert_array_byt;
     *size = sizeof(BYTE);
+  } else if (dtype == SEP_TUSHORT) {
+    *f = convert_array_ushort;
+    *size = sizeof(uint16_t);
   } else {
     *f = NULL;
     *size = 0;
