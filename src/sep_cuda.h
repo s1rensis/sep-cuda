@@ -213,12 +213,14 @@ inline int output_sep_dtype() {
   using Bare = remove_cvref_t<T>;
   if constexpr (std::is_same_v<Bare, int>) {
     return SEP_TINT;
+  } else if constexpr (is_ushort_v<Bare>) {
+    return SEP_TUSHORT;
   } else if constexpr (std::is_same_v<Bare, float>) {
     return SEP_TFLOAT;
   } else if constexpr (std::is_same_v<Bare, double>) {
     return SEP_TDOUBLE;
   } else {
-    static_assert(always_false_v<T>, "Output type must be int, float, or double");
+    static_assert(always_false_v<T>, "Output type must be uint16, int, float, or double");
   }
 }
 

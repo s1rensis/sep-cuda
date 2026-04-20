@@ -140,12 +140,29 @@ void write_array_int(const float *ptr, int64_t n, void *target) {
   }
 }
 
+void write_array_ushort(const float *ptr, int64_t n, void *target) {
+  uint16_t *out = (uint16_t *)target;
+  int64_t i;
+  for (i = 0; i < n; i++) {
+    int value = (int)(ptr[i] + 0.5f);
+    if (value < 0) {
+      value = 0;
+    } else if (value > 65535) {
+      value = 65535;
+    }
+    out[i] = (uint16_t)value;
+  }
+}
+
 int get_array_writer(int dtype, array_writer *f, int64_t *size) {
   int status = RETURN_OK;
 
   if (dtype == SEP_TINT) {
     *f = write_array_int;
     *size = sizeof(int);
+  } else if (dtype == SEP_TUSHORT) {
+    *f = write_array_ushort;
+    *size = sizeof(uint16_t);
   } else if (dtype == SEP_TDOUBLE) {
     *f = write_array_dbl;
     *size = sizeof(double);
@@ -182,6 +199,20 @@ void subtract_array_int(const float *ptr, int64_t n, void *target) {
   }
 }
 
+void subtract_array_ushort(const float *ptr, int64_t n, void *target) {
+  uint16_t *out = (uint16_t *)target;
+  int64_t i;
+  for (i = 0; i < n; i++) {
+    int value = (int)out[i] - (int)(ptr[i] + 0.5f);
+    if (value < 0) {
+      value = 0;
+    } else if (value > 65535) {
+      value = 65535;
+    }
+    out[i] = (uint16_t)value;
+  }
+}
+
 int get_array_subtractor(int dtype, array_writer *f, int64_t *size) {
   int status = RETURN_OK;
 
@@ -191,6 +222,9 @@ int get_array_subtractor(int dtype, array_writer *f, int64_t *size) {
   } else if (dtype == SEP_TINT) {
     *f = subtract_array_int;
     *size = sizeof(int);
+  } else if (dtype == SEP_TUSHORT) {
+    *f = subtract_array_ushort;
+    *size = sizeof(uint16_t);
   } else if (dtype == SEP_TDOUBLE) {
     *f = subtract_array_dbl;
     *size = sizeof(double);

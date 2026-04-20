@@ -38,6 +38,10 @@ target_include_directories(sep_cuda
 
 target_link_libraries(sep_cuda PRIVATE CUDA::cudart m)
 
+if(NOT APPLE)
+  target_link_options(sep_cuda PRIVATE "LINKER:-Bsymbolic-functions")
+endif()
+
 set_target_properties(sep_cuda PROPERTIES
   OUTPUT_NAME _sep_cuda
   EXPORT_NAME SEPCUDA
