@@ -448,8 +448,8 @@ __global__ void compute_mesh_u16_kernel(
     int64_t ny,
     float *back,
     float *sigma) {
-  __shared__ double s_sum[kThreadsPerBlock];
-  __shared__ double s_sumsq[kThreadsPerBlock];
+  __shared__ unsigned long long s_sum[kThreadsPerBlock];
+  __shared__ unsigned long long s_sumsq[kThreadsPerBlock];
   __shared__ int s_count[kThreadsPerBlock];
   __shared__ int s_hist[kMaxLevels];
   __shared__ float s_lcut;
@@ -459,7 +459,6 @@ __global__ void compute_mesh_u16_kernel(
   __shared__ float s_sigma_input;
   __shared__ int s_valid_count;
   __shared__ int s_nlevels;
-  __shared__ int s_bad_tile;
 
   const int tile_x = blockIdx.x;
   const int tile_y = blockIdx.y;
@@ -476,74 +475,55 @@ __global__ void compute_mesh_u16_kernel(
   const int tile_h = static_cast<int>((bh < (height - y0)) ? bh : (height - y0));
   const int tile_pixels = tile_w * tile_h;
   const float step = sqrtf(2.0f / static_cast<float>(M_PI)) * kQuantifNSigma / kQuantifAMin;
+  const int64_t tile_base = y0 * width + x0;
 
-  double sum = 0.0;
-  double sumsq = 0.0;
-  int count = 0;
+  unsigned long long sum = 0;
+  unsigned long long sumsq = 0;
 
   for (int i = local_tid; i < tile_pixels; i += blockDim.x) {
     const int local_x = i % tile_w;
     const int local_y = i / tile_w;
-    const int64_t index = (y0 + local_y) * width + (x0 + local_x);
-    const float pixel = static_cast<float>(image[index]);
+    const unsigned int pixel =
+        static_cast<unsigned int>(image[tile_base + static_cast<int64_t>(local_y) * width + local_x]);
     sum += pixel;
-    sumsq += pixel * pixel;
-    count++;
+    sumsq += static_cast<unsigned long long>(pixel) * pixel;
   }
 
   s_sum[local_tid] = sum;
   s_sumsq[local_tid] = sumsq;
-  s_count[local_tid] = count;
   __syncthreads();
 
   for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (local_tid < stride) {
       s_sum[local_tid] += s_sum[local_tid + stride];
       s_sumsq[local_tid] += s_sumsq[local_tid + stride];
-      s_count[local_tid] += s_count[local_tid + stride];
     }
     __syncthreads();
   }
 
   if (local_tid == 0) {
-    s_valid_count = s_count[0];
-    s_bad_tile = (static_cast<float>(s_valid_count) < static_cast<float>(tile_pixels) * kBackMinGoodFrac);
+    const double mean = static_cast<double>(s_sum[0]) / static_cast<double>(tile_pixels);
+    const double sig =
+        static_cast<double>(s_sumsq[0]) / static_cast<double>(tile_pixels) - mean * mean;
+    const double sigma1 = sig > 0.0 ? sqrt(sig) : 0.0;
 
-    if (s_bad_tile) {
-      back[tile_index] = -kBigFloat;
-      sigma[tile_index] = -kBigFloat;
-      s_lcut = 0.0f;
-      s_hcut = 0.0f;
-      s_qscale = 1.0f;
-      s_qzero = 0.0f;
-      s_sigma_input = 0.0f;
-      s_nlevels = 1;
-    } else {
-      const double mean = s_sum[0] / static_cast<double>(s_valid_count);
-      const double sig = s_sumsq[0] / static_cast<double>(s_valid_count) - mean * mean;
-      const double sigma1 = sig > 0.0 ? sqrt(sig) : 0.0;
-
-      s_lcut = static_cast<float>(mean - 2.0 * sigma1);
-      s_hcut = static_cast<float>(mean + 2.0 * sigma1);
-    }
+    s_lcut = static_cast<float>(mean - 2.0 * sigma1);
+    s_hcut = static_cast<float>(mean + 2.0 * sigma1);
   }
   __syncthreads();
 
-  if (s_bad_tile) {
-    return;
-  }
-
-  sum = 0.0;
-  sumsq = 0.0;
-  count = 0;
+  sum = 0;
+  sumsq = 0;
+  int count = 0;
   for (int i = local_tid; i < tile_pixels; i += blockDim.x) {
     const int local_x = i % tile_w;
     const int local_y = i / tile_w;
-    const int64_t index = (y0 + local_y) * width + (x0 + local_x);
-    const float pixel = static_cast<float>(image[index]);
+    const unsigned int pixel_u32 =
+        static_cast<unsigned int>(image[tile_base + static_cast<int64_t>(local_y) * width + local_x]);
+    const float pixel = static_cast<float>(pixel_u32);
     if (pixel >= s_lcut && pixel <= s_hcut) {
-      sum += pixel;
-      sumsq += pixel * pixel;
+      sum += pixel_u32;
+      sumsq += static_cast<unsigned long long>(pixel_u32) * pixel_u32;
       count++;
     }
   }
@@ -563,8 +543,9 @@ __global__ void compute_mesh_u16_kernel(
   }
 
   if (local_tid == 0) {
-    const double mean = s_sum[0] / static_cast<double>(s_count[0]);
-    const double sig = s_sumsq[0] / static_cast<double>(s_count[0]) - mean * mean;
+    const double mean = static_cast<double>(s_sum[0]) / static_cast<double>(s_count[0]);
+    const double sig =
+        static_cast<double>(s_sumsq[0]) / static_cast<double>(s_count[0]) - mean * mean;
     const float sigma2 = static_cast<float>(sig > 0.0 ? sqrt(sig) : 0.0);
 
     s_valid_count = s_count[0];
@@ -590,8 +571,8 @@ __global__ void compute_mesh_u16_kernel(
   for (int i = local_tid; i < tile_pixels; i += blockDim.x) {
     const int local_x = i % tile_w;
     const int local_y = i / tile_w;
-    const int64_t index = (y0 + local_y) * width + (x0 + local_x);
-    const float pixel = static_cast<float>(image[index]);
+    const float pixel = static_cast<float>(
+        image[tile_base + static_cast<int64_t>(local_y) * width + local_x]);
     const int bin = static_cast<int>(pixel / s_qscale + cste);
     if (bin >= 0 && bin < s_nlevels) {
       atomicAdd(&s_hist[bin], 1);
