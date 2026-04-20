@@ -7,6 +7,17 @@
 extern "C" {
 #endif
 
+SEP_API int sep_cuda_subtract_background_u16(
+    const uint16_t *src,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    int64_t fw,
+    int64_t fh,
+    double fthresh,
+    uint16_t *dst_subtracted);
+
 SEP_API int sep_cuda_subtract_background_and_fill_rms_u16(
     const uint16_t *src,
     int64_t width,
@@ -23,6 +34,25 @@ SEP_API int sep_cuda_subtract_background_and_fill_rms_u16(
 }
 
 namespace sepcuda {
+
+inline void subtract_background_u16(
+    const uint16_t *src,
+    int64_t width,
+    int64_t height,
+    uint16_t *dst_subtracted,
+    BackgroundOptions options = {}) {
+  detail::throw_on_error(
+      sep_cuda_subtract_background_u16(
+          src,
+          width,
+          height,
+          options.bw,
+          options.bh,
+          options.fw,
+          options.fh,
+          options.fthresh,
+          dst_subtracted));
+}
 
 inline void subtract_background_and_fill_rms_u16(
     const uint16_t *src,

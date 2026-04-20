@@ -35,6 +35,8 @@ int main() {
   constexpr int64_t width = 128;
   constexpr int64_t height = 96;
   std::vector<uint16_t> image(static_cast<size_t>(width * height));
+  std::vector<uint16_t> ref_sub_only(image.size());
+  std::vector<uint16_t> opt_sub_only(image.size());
   std::vector<uint16_t> ref_sub(image.size());
   std::vector<uint16_t> ref_rms(image.size());
   std::vector<uint16_t> opt_sub(image.size());
@@ -42,7 +44,40 @@ int main() {
 
   fill_scene(image, width, height);
 
-  int status = sep_cuda_subtract_background_and_fill_rms_u16_reference(
+  int status = sep_cuda_subtract_background_u16_reference(
+      image.data(), width, height, 32, 32, 3, 3, 0.0, ref_sub_only.data());
+  if (status == SEP_CUDA_UNAVAILABLE || status == SEP_CUDA_RUNTIME_ERROR) {
+    return 77;
+  }
+  if (status != RETURN_OK) {
+    char err[128];
+    char detail[512];
+    sep_get_errmsg(status, err);
+    sep_get_errdetail(detail);
+    std::fprintf(stderr, "reference subtract-only u16 pipeline failed: %s (%s)\n", err, detail);
+    return 1;
+  }
+
+  status = sep_cuda_subtract_background_u16(
+      image.data(), width, height, 32, 32, 3, 3, 0.0, opt_sub_only.data());
+  if (status == SEP_CUDA_UNAVAILABLE || status == SEP_CUDA_RUNTIME_ERROR) {
+    return 77;
+  }
+  if (status != RETURN_OK) {
+    char err[128];
+    char detail[512];
+    sep_get_errmsg(status, err);
+    sep_get_errdetail(detail);
+    std::fprintf(stderr, "optimized subtract-only u16 pipeline failed: %s (%s)\n", err, detail);
+    return 1;
+  }
+
+  if (max_abs_diff(ref_sub_only, opt_sub_only) > 1) {
+    std::fprintf(stderr, "subtract-only u16 pipeline mismatch exceeds tolerance\n");
+    return 1;
+  }
+
+  status = sep_cuda_subtract_background_and_fill_rms_u16_reference(
       image.data(), width, height, 32, 32, 3, 3, 0.0, ref_sub.data(), ref_rms.data());
   if (status == SEP_CUDA_UNAVAILABLE || status == SEP_CUDA_RUNTIME_ERROR) {
     return 77;

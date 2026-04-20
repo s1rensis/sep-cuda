@@ -58,11 +58,27 @@ SEP_API int sep_cuda_subtract_background_and_fill_rms_u16_reference(
     uint16_t *dst_subtracted,
     uint16_t *dst_rms);
 
+SEP_API int sep_cuda_subtract_background_u16_reference(
+    const uint16_t *src,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    int64_t fw,
+    int64_t fh,
+    double fthresh,
+    uint16_t *dst_subtracted);
+
 int sep_cuda_subtract_background_and_fill_rms_u16_fast(
     const sep_bkg *bkg,
     const uint16_t *src,
     uint16_t *dst_subtracted,
     uint16_t *dst_rms);
+
+int sep_cuda_subtract_background_u16_fast(
+    const sep_bkg *bkg,
+    const uint16_t *src,
+    uint16_t *dst_subtracted);
 
 #ifdef __cplusplus
 }

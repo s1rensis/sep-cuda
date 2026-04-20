@@ -486,6 +486,44 @@ __global__ void subtract_background_u16_kernel(
   }
 }
 
+__global__ void subtract_background_only_u16_kernel(
+    const uint16_t *src,
+    int64_t width,
+    int64_t height,
+    int64_t bw,
+    int64_t bh,
+    int64_t nx,
+    int64_t ny,
+    const float *back,
+    const float *dback,
+    uint16_t *dst_subtracted) {
+  extern __shared__ float shared[];
+  float *back_node = shared;
+  float *back_dnode = back_node + nx;
+  float *back_u = back_dnode + nx;
+
+  const int64_t y = static_cast<int64_t>(blockIdx.x);
+  const int64_t tid = static_cast<int64_t>(threadIdx.x);
+
+  if (y >= height) {
+    return;
+  }
+
+  if (tid == 0) {
+    prepare_row_spline(back, dback, nx, ny, bh, y, back_node, back_dnode, back_u);
+  }
+  __syncthreads();
+
+  const int64_t row_offset = y * width;
+  for (int64_t x = tid; x < width; x += blockDim.x) {
+    const float background = evaluate_row_spline(back_node, back_dnode, nx, bw, x);
+    const int background_i = static_cast<int>(background + 0.5f);
+    const int corrected = static_cast<int>(src[row_offset + x]) - background_i;
+
+    dst_subtracted[row_offset + x] = static_cast<uint16_t>(corrected > 0 ? corrected : 0);
+  }
+}
+
 }  // namespace
 
 extern "C" void sepcuda_profile_reset_runtime_state(void) {
@@ -764,6 +802,102 @@ extern "C" int sep_cuda_subtract_background_and_fill_rms_u16_fast(
   }
   if (err != cudaSuccess) {
     return set_cuda_error(err, "cudaMemcpy(u16_outputs)");
+  }
+
+  return RETURN_OK;
+}
+
+extern "C" int sep_cuda_subtract_background_u16_fast(
+    const sep_bkg *bkg,
+    const uint16_t *src,
+    uint16_t *dst_subtracted) {
+  cudaError_t err;
+  MeshWorkspace &workspace = g_mesh_workspace;
+  const int64_t width = bkg->w;
+  const int64_t height = bkg->h;
+  const int64_t mesh_count = bkg->n;
+  const size_t image_bytes = static_cast<size_t>(width * height) * sizeof(uint16_t);
+  const size_t coeff_bytes = static_cast<size_t>(mesh_count) * sizeof(float);
+  const size_t shared_bytes = static_cast<size_t>(3 * bkg->nx) * sizeof(float);
+  int status;
+
+  if (bkg == nullptr || src == nullptr || dst_subtracted == nullptr) {
+    put_errdetail("u16 fast path received a null pointer");
+    return ILLEGAL_APER_PARAMS;
+  }
+
+  status = ensure_device_buffer(
+      &workspace.d_src_u16,
+      &workspace.src_u16_capacity_bytes,
+      image_bytes,
+      "src_u16",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_dst_sub_u16,
+      &workspace.dst_sub_u16_capacity_bytes,
+      image_bytes,
+      "dst_sub_u16",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_coeff_back,
+      &workspace.coeff_back_capacity_bytes,
+      coeff_bytes,
+      "coeff_back",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+  status = ensure_device_buffer(
+      &workspace.d_coeff_dback,
+      &workspace.coeff_dback_capacity_bytes,
+      coeff_bytes,
+      "coeff_dback",
+      nullptr);
+  if (status != RETURN_OK) {
+    return status;
+  }
+
+  err = cudaMemcpy(workspace.d_src_u16, src, image_bytes, cudaMemcpyHostToDevice);
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(src_u16)");
+  }
+  err = cudaMemcpy(workspace.d_coeff_back, bkg->back, coeff_bytes, cudaMemcpyHostToDevice);
+  if (err == cudaSuccess) {
+    err = cudaMemcpy(workspace.d_coeff_dback, bkg->dback, coeff_bytes, cudaMemcpyHostToDevice);
+  }
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(background_coefficients)");
+  }
+
+  subtract_background_only_u16_kernel<<<static_cast<unsigned int>(height), kThreadsPerBlock, shared_bytes>>>(
+      workspace.d_src_u16,
+      width,
+      height,
+      bkg->bw,
+      bkg->bh,
+      bkg->nx,
+      bkg->ny,
+      workspace.d_coeff_back,
+      workspace.d_coeff_dback,
+      workspace.d_dst_sub_u16);
+
+  err = cudaGetLastError();
+  if (err == cudaSuccess) {
+    err = cudaDeviceSynchronize();
+  }
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "subtract_background_only_u16_kernel");
+  }
+
+  err = cudaMemcpy(dst_subtracted, workspace.d_dst_sub_u16, image_bytes, cudaMemcpyDeviceToHost);
+  if (err != cudaSuccess) {
+    return set_cuda_error(err, "cudaMemcpy(dst_subtracted_u16)");
   }
 
   return RETURN_OK;
